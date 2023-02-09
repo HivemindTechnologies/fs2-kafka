@@ -6,13 +6,14 @@
 
 package fs2.kafka
 
+import cats.effect.kernel.Resource.ExitCase
 import cats.effect.syntax.all._
 import cats.effect.{Async, Outcome, Resource}
 import cats.syntax.all._
 import fs2.kafka.internal._
 import fs2.kafka.internal.converters.collection._
 import fs2.kafka.producer.MkProducer
-import fs2.{Chunk, Stream}
+import fs2.{Chunk, Pipe, Stream}
 import org.apache.kafka.clients.producer.RecordMetadata
 import org.apache.kafka.common.{Metric, MetricName}
 
@@ -71,6 +72,8 @@ object TransactionalKafkaProducer {
       * if the whole transaction completes successfully.
       */
     def produceWithoutOffsets[P](records: ProducerRecords[P, K, V]): F[ProducerResult[P, K, V]]
+
+    def produceStreamWithoutOffsets[P]: Pipe[F, ProducerRecords[P, K, V], ProducerResult[P, K, V]]
   }
 
   /**
@@ -131,6 +134,35 @@ object TransactionalKafkaProducer {
           records: ProducerRecords[P, K, V]
         ): F[ProducerResult[P, K, V]] =
           produceTransaction(records.records, None).map(ProducerResult(_, records.passthrough))
+
+        override def produceStreamWithoutOffsets[P]
+          : Pipe[F, ProducerRecords[P, K, V], ProducerResult[P, K, V]] = { records =>
+          Stream
+            .resource(withProducer.semaphore.permit)
+            .evalMap { _ =>
+              withProducer.apply[(KafkaByteProducer, Blocking[F])] {
+                case (producer, blocking, _) =>
+                  blocking(producer.beginTransaction()) >> F.pure(producer -> blocking)
+              }
+            }
+            .flatMap {
+              case (producer, blocking) =>
+                records.evalMap { chunk =>
+                  chunk.records
+                    .traverse(
+                      KafkaProducer
+                        .produceRecord(keySerializer, valueSerializer, producer, blocking)
+                    )
+                    .flatMap(_.sequence.map(ProducerResult(_, chunk.passthrough)))
+                }
+            }
+            .onFinalizeCase {
+              case ExitCase.Succeeded =>
+                withProducer.blocking(_.commitTransaction())
+              case ExitCase.Errored(_) | ExitCase.Canceled =>
+                withProducer.blocking(_.abortTransaction())
+            }
+        }
 
         private[this] def produceTransaction[P](
           records: Chunk[ProducerRecord[K, V]],

@@ -14,6 +14,8 @@ import fs2.kafka.producer.MkProducer
 import fs2.kafka.{KafkaByteProducer, TransactionalProducerSettings}
 
 private[kafka] sealed abstract class WithTransactionalProducer[F[_]] {
+  def semaphore: Semaphore[F]
+
   def apply[A](f: (KafkaByteProducer, Blocking[F], ExclusiveAccess[F, A]) => F[A]): F[A]
 
   def exclusiveAccess[A](f: (KafkaByteProducer, Blocking[F]) => F[A]): F[A] = apply {
@@ -66,6 +68,8 @@ private[kafka] object WithTransactionalProducer {
     _blocking: Blocking[F],
     transactionSemaphore: Semaphore[F]
   ): WithTransactionalProducer[F] = new WithTransactionalProducer[F] {
+    override def semaphore: Semaphore[F] = transactionSemaphore
+
     override def apply[A](
       f: (KafkaByteProducer, Blocking[F], ExclusiveAccess[F, A]) => F[A]
     ): F[A] =
