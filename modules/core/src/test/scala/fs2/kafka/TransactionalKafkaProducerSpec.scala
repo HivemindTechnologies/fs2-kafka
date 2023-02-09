@@ -34,6 +34,12 @@ class TransactionalKafkaProducerSpec extends BaseKafkaSpec with EitherValues {
     }
   }
 
+  it("should be able to stream records without offsets in a transaction") {
+    withTopic { topic =>
+      testStream(topic)
+    }
+  }
+
   it("should be able to produce single records with offsets in a transaction") {
     withTopic { topic =>
       testSingle(
@@ -195,6 +201,56 @@ class TransactionalKafkaProducerSpec extends BaseKafkaSpec with EitherValues {
     }.compile.lastOrError.unsafeRunSync()
   }
 
+  private def testStream(topic: String) = {
+    createCustomTopic(topic, partitions = 3)
+
+    val toProduce = Stream.emits(0 to 100).map(n => s"key-$n" -> s"value-$n")
+
+    val toPassthrough = "passthrough"
+
+    val produced = (for {
+      producer <- TransactionalKafkaProducer.stream(
+        TransactionalProducerSettings(
+          s"id-$topic",
+          producerSettings[IO]
+            .withRetries(Int.MaxValue)
+        )
+      )
+      recordsToProduce = toProduce.map {
+        case (key, value) => ProducerRecord(topic, key, value)
+      }
+      result <- recordsToProduce
+        .map { record =>
+          ProducerRecords.one(record, toPassthrough)
+        }
+        .through(producer.produceStreamWithoutOffsets)
+    } yield result).compile.toList.unsafeRunSync()
+
+    val records = {
+      Chunk.seq(produced).flatMap(_.records).map {
+        case (record, _) =>
+          record.key -> record.value
+      }
+    }
+
+    val passthroughs = produced.map(_.passthrough)
+
+    assert(
+      records == Chunk.seq(toProduce.compile.toList) && passthroughs.forall(_ == toPassthrough)
+    )
+
+    val consumed = {
+      val customConsumerProperties =
+        Map(ConsumerConfig.ISOLATION_LEVEL_CONFIG -> "read_committed")
+      consumeNumberKeyedMessagesFrom[String, String](
+        topic,
+        records.size,
+        customProperties = customConsumerProperties
+      )
+    }
+
+    consumed should contain theSameElementsAs records.toList
+  }
   private def testMultiple(topic: String, makeOffset: Option[Int => CommittableOffset[IO]]) = {
     createCustomTopic(topic, partitions = 3)
     val toProduce =
